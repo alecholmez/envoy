@@ -404,11 +404,18 @@ void Filter::continueStatusInternal(ProcessorState& state, GolangStatus status) 
 
     case FilterState::ProcessingTrailer:
       state.continueDoData();
+      if (hasDestroyed()) {
+        return;
+      }
       state.continueProcessing();
       break;
 
     default:
       ASSERT(0, "unexpected state");
+    }
+
+    if (hasDestroyed()) {
+      return;
     }
   }
 
@@ -426,6 +433,9 @@ void Filter::continueStatusInternal(ProcessorState& state, GolangStatus status) 
     auto done = doDataGo(state, state.getBufferData(), state.getEndStream());
     if (done) {
       state.continueDoData();
+      if (hasDestroyed()) {
+        return;
+      }
     } else {
       // do not process trailers when data is not finished
       return;
@@ -445,6 +455,7 @@ void Filter::sendLocalReplyInternal(
     ProcessorState& state, Http::Code response_code, absl::string_view body_text,
     std::function<void(Http::ResponseHeaderMap& headers)> modify_headers,
     Grpc::Status::GrpcStatus grpc_status, absl::string_view details) {
+  ASSERT(state.isThreadSafe());
   ENVOY_LOG(debug, "sendLocalReply Internal, state: {}, response code: {}", state.stateStr(),
             int(response_code));
 
@@ -461,23 +472,30 @@ CAPIStatus
 Filter::sendLocalReply(ProcessorState& state, Http::Code response_code, std::string body_text,
                        std::function<void(Http::ResponseHeaderMap& headers)> modify_headers,
                        Grpc::Status::GrpcStatus grpc_status, std::string details) {
-  // lock until this function return since it may running in a Go thread.
-  Thread::LockGuard lock(mutex_);
-  if (has_destroyed_) {
-    ENVOY_LOG(debug, "golang filter has been destroyed");
-    return CAPIStatus::CAPIFilterIsDestroy;
+  bool on_worker_thread = state.isThreadSafe();
+  {
+    Thread::LockGuard lock(mutex_);
+    if (has_destroyed_) {
+      ENVOY_LOG(debug, "golang filter has been destroyed");
+      return CAPIStatus::CAPIFilterIsDestroy;
+    }
+    if (!state.isProcessingInGo()) {
+      ENVOY_LOG(debug, "golang filter is not processing Go");
+      return CAPIStatus::CAPINotInGo;
+    }
+    ENVOY_LOG(debug, "sendLocalReply, response code: {}", int(response_code));
   }
-  if (!state.isProcessingInGo()) {
-    ENVOY_LOG(debug, "golang filter is not processing Go");
-    return CAPIStatus::CAPINotInGo;
+
+  // See continueStatus() for the reentrancy/deadlock rationale.
+  if (on_worker_thread) {
+    sendLocalReplyInternal(state, response_code, body_text, modify_headers, grpc_status, details);
+    return CAPIStatus::CAPIOK;
   }
-  ENVOY_LOG(debug, "sendLocalReply, response code: {}", int(response_code));
 
   auto weak_ptr = weak_from_this();
   state.getDispatcher().post([this, &state, weak_ptr, response_code, body_text, modify_headers,
                               grpc_status, details] {
     if (!weak_ptr.expired() && !hasDestroyed()) {
-      ASSERT(state.isThreadSafe());
       sendLocalReplyInternal(state, response_code, body_text, modify_headers, grpc_status, details);
     } else {
       ENVOY_LOG(debug, "golang filter has gone or destroyed in sendLocalReply");
@@ -499,25 +517,38 @@ CAPIStatus Filter::sendPanicReply(ProcessorState& state, absl::string_view detai
 }
 
 CAPIStatus Filter::continueStatus(ProcessorState& state, GolangStatus status) {
-  // lock until this function return since it may running in a Go thread.
-  Thread::LockGuard lock(mutex_);
-  if (has_destroyed_) {
-    ENVOY_LOG(debug, "golang filter has been destroyed");
-    return CAPIStatus::CAPIFilterIsDestroy;
+  // isThreadSafe() is a pure thread-id comparison, safe to read without the mutex.
+  bool on_worker_thread = state.isThreadSafe();
+  {
+    Thread::LockGuard lock(mutex_);
+    if (has_destroyed_) {
+      ENVOY_LOG(debug, "golang filter has been destroyed");
+      return CAPIStatus::CAPIFilterIsDestroy;
+    }
+    if (!state.isProcessingInGo()) {
+      ENVOY_LOG(debug, "golang filter is not processing Go");
+      return CAPIStatus::CAPINotInGo;
+    }
+    ENVOY_LOG(debug, "golang filter continue from Go, status: {}, state: {}", int(status),
+              state.stateStr());
   }
-  if (!state.isProcessingInGo()) {
-    ENVOY_LOG(debug, "golang filter is not processing Go");
-    return CAPIStatus::CAPINotInGo;
+  // Lock released before calling into the filter chain to avoid deadlocking:
+  // continueStatusInternal() calls hasDestroyed() which re-acquires the non-reentrant mutex_.
+  //
+  // NB: inline execution means continueStatusInternal re-enters the filter chain
+  // (continueProcessing / continueDoData / sendLocalReply) while the cgo call is still on the
+  // stack. This is the same reentrancy model as the existing addData inline path. The unit tests
+  // verify the branch selection but do not reproduce the full cgo-on-stack scenario; the existing
+  // Go integration tests (golang_filter_integration_test) exercise that path end-to-end.
+
+  if (on_worker_thread) {
+    continueStatusInternal(state, status);
+    return CAPIStatus::CAPIOK;
   }
-  ENVOY_LOG(debug, "golang filter continue from Go, status: {}, state: {}", int(status),
-            state.stateStr());
 
   auto weak_ptr = weak_from_this();
-  // TODO: skip post event to dispatcher, and return continue in the caller,
-  // when it's invoked in the current envoy thread, for better performance & latency.
   state.getDispatcher().post([this, &state, weak_ptr, status] {
     if (!weak_ptr.expired() && !hasDestroyed()) {
-      ASSERT(state.isThreadSafe());
       continueStatusInternal(state, status);
     } else {
       ENVOY_LOG(debug, "golang filter has gone or destroyed in continueStatus event");
@@ -546,6 +577,8 @@ CAPIStatus Filter::addData(ProcessorState& state, absl::string_view data, bool i
   }
 
   if (state.isThreadSafe()) {
+    // NB: unlike continueStatus/sendLocalReply, we can hold mutex_ here because
+    // state.addData() does not call hasDestroyed() or re-acquire the mutex.
     Buffer::OwnedImpl buffer;
     buffer.add(data);
     state.addData(buffer, is_streaming);
@@ -997,7 +1030,8 @@ CAPIStatus Filter::setUpstreamOverrideHost(ProcessorState& state, absl::string_v
 
   if (state.isThreadSafe()) {
     // it's safe to write header in the safe thread.
-    s->setUpstreamOverrideHost(std::make_pair(std::string(host), strict));
+    s->setUpstreamOverrideHost(
+        Upstream::LoadBalancerContext::OverrideHost{std::string(host), strict});
   } else {
     // should deep copy the string_view before post to dispatcher callback.
     auto host_str = std::string(host);
@@ -1008,7 +1042,8 @@ CAPIStatus Filter::setUpstreamOverrideHost(ProcessorState& state, absl::string_v
     // in the Go thread.
     state.getDispatcher().post([this, s, weak_ptr, host_str] {
       if (!weak_ptr.expired() && !hasDestroyed()) {
-        s->setUpstreamOverrideHost(std::make_pair(std::string(host_str), false));
+        s->setUpstreamOverrideHost(
+            Upstream::LoadBalancerContext::OverrideHost{std::string(host_str), false});
       } else {
         ENVOY_LOG(debug, "golang filter has gone or destroyed in setUpstreamOverrideHost");
       }
@@ -1190,9 +1225,8 @@ CAPIStatus Filter::getStringValue(int id, uint64_t* value_data, int* value_len) 
     }
     break;
   case EnvoyValue::UpstreamClusterName:
-    if (streamInfo().upstreamClusterInfo().has_value() &&
-        streamInfo().upstreamClusterInfo().value()) {
-      req_->strValue = streamInfo().upstreamClusterInfo().value()->name();
+    if (const auto cluster_info = streamInfo().upstreamClusterInfo()) {
+      req_->strValue = cluster_info->name();
     } else {
       return CAPIStatus::CAPIValueNotFound;
     }
